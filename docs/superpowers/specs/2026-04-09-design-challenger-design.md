@@ -12,8 +12,9 @@ The human sets the goal and approves the output. Everything in between is autono
 |------|-------------|
 | **Writer** | Brainstorms, researches, writes specs and plans. Self-answers clarifying questions from codebase context. |
 | **Challenger** | Independently explores the codebase and web, produces counter-designs, extracts assumptions, then rigorously tests them against evidence. Read-only — never modifies files. |
-| **Judge** | Lightweight filter agent that evaluates Challenger findings for actionability before they reach the Writer. Removes noise, consolidates duplicates, applies the "won't change the decision" filter. |
-| **Orchestrator** | Node.js script that manages the multi-agent flow, routes structured messages, validates message schemas, enforces termination, tracks context budgets, captures decisions, and collects quality metrics. |
+| **Judge** | Lightweight filter agent that evaluates Challenger findings for actionability before they reach the Writer. Removes noise, consolidates duplicates, adjusts severity proportionately. All actionable findings are forwarded regardless of severity. |
+| **Verifier** | Ephemeral agent that confirms external claims — both the Writer's pre-review assumptions and the Challenger's external evidence citations. Prevents building on wrong API assumptions and prevents the Writer from chasing hallucinated evidence. |
+| **Orchestrator** | Node.js script that manages the multi-agent flow, routes structured messages, validates message schemas, enforces finding-level checklist completion, propagates upstream fixes, enforces termination, tracks context budgets, captures decisions, and collects quality metrics. |
 | **User** | Sets the design goal. Reviews and approves at gates. Does not participate in the agent loop. |
 
 ## Architecture
@@ -29,6 +30,10 @@ Orchestrator (Node.js CLI)
   |     \-- Has: file tools, web search (NO bash, NO write/edit)
   |-- Judge Agent (Claude Code SDK -- ephemeral per evaluation)
   |     \-- Filters findings for actionability before forwarding to Writer
+  |-- Verification Agent (Claude Code SDK -- ephemeral per check)
+  |     \-- Confirms external assumptions and Challenger evidence claims
+  |-- Finding Checklist (Orchestrator-internal)
+  |     \-- Tracks disposition of every finding ID, blocks round advancement until complete
   |-- State Manager
   |     \-- Checkpoints run state for resume, captures DDL
   |-- Context Manager
@@ -171,6 +176,16 @@ Orchestrator
 Orchestrator
   |-- Continues Writer session: "Write the design spec"
   |     Writer produces full spec document
+  |     Writer lists key external assumptions (library APIs, platform behavior,
+  |       integration contracts) at the end of the spec
+  |
+  |-- Assumption Verification (before review begins):
+  |     Orchestrator extracts assumptions tagged as "external" by the Writer
+  |     Orchestrator spawns lightweight verification agents to check external claims:
+  |       - Library API assumptions → agent reads SDK docs/types, confirms or refutes
+  |       - Platform behavior → agent tests or reads documentation
+  |     Verification results are fed to the Writer to fix before the Challenger sees the spec
+  |     This prevents the most basic class of errors (building on wrong API assumptions)
   |
   |-- Continues Challenger session: "Review this spec"
   |     Challenger runs the escalating review protocol (see below):
@@ -186,15 +201,24 @@ Orchestrator
   |
   |     Each round:
   |       Orchestrator validates Challenger output against JSON schema
-  |       Judge filters findings (removes noise, applies "won't change the decision" filter)
+  |       If findings cite external evidence (evidence_type: "external"):
+  |         Orchestrator spawns verification agent to confirm external claims
+  |         Unverifiable claims are flagged; verified claims are marked trusted
+  |       Judge filters findings (removes noise, consolidates duplicates, forwards all actionable)
   |       Orchestrator tells Writer which findings to address
+  |       Writer responds with structured disposition for EVERY finding ID
+  |       Orchestrator checks: does every forwarded finding ID have a disposition?
+  |         Missing IDs → round does not pass, Writer is re-prompted for missing dispositions
+  |       If findings have upstream_issue: true:
+  |         Orchestrator propagates fixes to the upstream source document
+  |         Both current artifact AND upstream doc are updated
   |       Orchestrator tells Challenger which findings were addressed between rounds
   |       Orchestrator captures all decisions to DDL
   |       Orchestrator checks context budgets, triggers masking if needed
-  |       Exit early if no remaining CRITICAL or IMPORTANT findings
+  |       Exit early if no remaining findings of any severity
   |
   \-- GATE 2 -> User sees: spec file path, review summary, assumption list,
-        metrics snapshot, any unresolved concerns
+        metrics snapshot, any unresolved concerns, finding completion checklist
         [Approve / Request changes / Abort]
 ```
 
@@ -204,13 +228,20 @@ Orchestrator
 Orchestrator
   |-- Continues Writer session: "Write the implementation plan"
   |     Writer produces detailed plan
+  |     Writer lists key external assumptions at the end of the plan
+  |
+  |-- Assumption Verification (same as Stage 2):
+  |     Orchestrator verifies external assumptions before review begins
+  |     Writer fixes any refuted assumptions before the Challenger sees the plan
   |
   |-- Continues Challenger session: "Review this plan"
   |     Same escalating review protocol (counter-design + hypothesis + skeptical + pre-mortem)
   |     Challenger now has context from brainstorming + spec review
-  |     Orchestrator captures decisions to DDL
+  |     Same per-round process: external evidence verification, finding-level checklist
+  |       enforcement, upstream issue propagation, DDL capture
   |
-  \-- GATE 3 -> User sees: plan file path, review summary, final metrics
+  \-- GATE 3 -> User sees: plan file path, review summary, final metrics,
+        finding completion checklist
         [Approve / Request changes / Abort]
 ```
 
@@ -286,10 +317,13 @@ FINDING: <one-line summary>
 SEVERITY: CRITICAL | IMPORTANT | MINOR
 ASSUMPTION: #N (if tied to a specific assumption)
 COUNTER_DESIGN_DIVERGENCE: true/false (whether this was surfaced by the counter-design analysis)
+UPSTREAM_ISSUE: true/false (whether this is a bug in a source document, not the current artifact)
+UPSTREAM_SOURCE: <file path of the upstream doc, if UPSTREAM_ISSUE is true>
 EVIDENCE:
   - <file path>:<line number> -- <what it shows>
   - <URL> -- <what it shows>
   - <git commit hash> -- <what it shows>
+EVIDENCE_TYPE: codebase | external (whether primary evidence comes from the repo or external sources)
 RECOMMENDATION: <specific action the Writer should take>
 ```
 
@@ -299,14 +333,14 @@ RECOMMENDATION: <specific action the Writer should take>
 |----------|---------|---------------------|
 | **CRITICAL** | Design will break something or miss a hard requirement | Yes |
 | **IMPORTANT** | Gap or inconsistency that will cause problems | Yes |
-| **MINOR** | Improvement that can wait | No — captured in DDL, not forwarded to Writer |
+| **MINOR** | Improvement that won't break anything but still a gap | Yes |
 
-MINOR findings are logged in the Design Decision Log but not forwarded to the Writer. This prevents decision fatigue from low-signal feedback. If the user wants to see MINORs, they're in the DDL.
+All findings that survive the Judge's actionability filter are forwarded to the Writer. Gaps are gaps regardless of severity — a MINOR finding left unaddressed is still a gap in the design. Severity determines priority ordering (Writer addresses CRITICALs first), not whether the finding gets addressed. The Judge still filters non-actionable and duplicate findings — severity alone does not determine what gets forwarded.
 
 ### Termination
 
 - Max 3 review rounds per stage (one round per protocol phase)
-- A stage passes early if the Challenger reports no remaining CRITICAL or IMPORTANT findings
+- A stage passes early if the Challenger reports no remaining findings of any severity
 - If max rounds reached with unresolved concerns, those are surfaced to the user at the gate with the Challenger's reasoning and evidence
 
 ## Judge Behavior
@@ -322,27 +356,88 @@ HubSpot's production AI code review agent found that adding a Judge Agent that f
 For each Challenger finding, the Judge asks:
 
 1. **Actionable?** — Does the finding point to a specific, fixable issue with enough evidence to act on? Vague concerns with no evidence are filtered.
-2. **Won't change the decision?** — If addressing this finding would not change any architectural decision in the spec, it is demoted to DDL-only regardless of stated severity.
-3. **Duplicate?** — Is this substantially the same issue as another finding, phrased differently? Consolidate into one.
-4. **Proportionate?** — Is the severity appropriate given the evidence? A CRITICAL finding backed by one ambiguous code comment should be demoted to IMPORTANT.
+2. **Duplicate?** — Is this substantially the same issue as another finding, phrased differently? Consolidate into one.
+3. **Proportionate?** — Is the severity appropriate given the evidence? A CRITICAL finding backed by one ambiguous code comment should be demoted to IMPORTANT.
+
+The Judge does NOT filter findings based on severity or perceived impact. If a finding is actionable, non-duplicate, and evidence-backed, it is forwarded to the Writer regardless of whether it's CRITICAL or MINOR. Gaps are gaps.
 
 ### Judge Output
 
 ```json
 {
   "forwarded_findings": [
-    { "original_id": 1, "adjusted_severity": "CRITICAL", "rationale": "..." }
-  ],
-  "ddl_only_findings": [
-    { "original_id": 4, "reason": "won't change architectural decision", "rationale": "..." }
+    { "original_id": 1, "adjusted_severity": "CRITICAL", "rationale": "..." },
+    { "original_id": 4, "adjusted_severity": "MINOR", "rationale": "..." }
   ],
   "filtered_findings": [
-    { "original_id": 7, "reason": "not actionable — no evidence cited", "rationale": "..." }
+    { "original_id": 7, "reason": "not actionable — no evidence cited", "rationale": "..." },
+    { "original_id": 9, "reason": "duplicate of finding 4", "rationale": "..." }
   ]
 }
 ```
 
-The Orchestrator uses the Judge's output to route findings: forwarded findings go to the Writer, DDL-only findings go to the Design Decision Log, filtered findings are discarded (logged in run state for debugging).
+The Orchestrator uses the Judge's output to route findings: forwarded findings go to the Writer (all severities), filtered findings are discarded (logged in run state for debugging). All findings — forwarded and filtered — are captured in the DDL for the record.
+
+## Orchestrator Enforcement Behaviors
+
+The Orchestrator is not just a message router — it actively enforces thoroughness through four mechanisms that prevent the agents from cutting corners.
+
+### Assumption Verification
+
+Before the Challenger reviews an artifact, the Orchestrator verifies the Writer's external assumptions. This prevents the most embarrassing class of errors: building an entire design on an API that doesn't work the way you assumed.
+
+1. The Writer's system prompt instructs it to list key external assumptions at the end of each artifact (library APIs, platform behaviors, integration contracts, third-party service capabilities).
+2. The Orchestrator extracts assumptions tagged as external.
+3. For each external assumption, the Orchestrator spawns a lightweight verification agent (Haiku, read-only, ephemeral) that checks the claim against SDK docs, type definitions, library READMEs, or web documentation.
+4. Verification results are fed back to the Writer. Refuted assumptions must be fixed before the artifact goes to the Challenger.
+
+This doesn't replace the Challenger's hypothesis testing — it's a pre-filter. The Challenger still extracts and tests assumptions, but the most obvious errors are caught before they reach the adversarial review. The Challenger can then focus on deeper issues instead of catching basic API misuse.
+
+### Finding-Level Checklist Enforcement
+
+The Orchestrator mechanically enforces that every finding gets a disposition. This is not judgment-based — it's a completeness check that prevents selective fixing.
+
+After the Writer receives findings and responds:
+
+1. The Orchestrator extracts the list of finding IDs that were forwarded to the Writer.
+2. The Orchestrator checks the Writer's structured disposition response for a matching entry for every ID.
+3. Any finding ID missing from the disposition list → the round does not pass. The Writer is re-prompted: "You did not address findings [3, 7, 12]. Provide a disposition for each: addressed (with what changed) or rejected (with reasoning)."
+4. Only when every finding ID has a disposition does the round advance.
+
+Valid dispositions:
+- **Addressed**: The Writer changed the artifact to resolve the finding. Must reference what changed.
+- **Rejected**: The Writer disagrees with the finding. Must provide reasoning. The Challenger will see the rejection and can re-raise in the next round if the reasoning is weak.
+
+There is no "deferred" or "acknowledged" disposition. Every finding is either fixed or explicitly rejected with reasoning. This forces the Writer to engage with every finding rather than silently skipping low-severity ones.
+
+### Upstream Issue Propagation
+
+When the Challenger reviews a downstream artifact (e.g., an implementation plan), it may discover bugs in the upstream source document (e.g., the design spec). The finding format includes `upstream_issue` and `upstream_source` fields for this.
+
+When the Orchestrator encounters findings with `upstream_issue: true`:
+
+1. The finding is forwarded to the Writer like any other finding.
+2. The Writer must fix both the current artifact AND the upstream source document.
+3. The Orchestrator verifies both files were modified (or the Writer must explain why the upstream doc doesn't need changes).
+4. The DDL records the upstream fix with a cross-reference to both documents.
+
+This prevents the pattern where a plan faithfully implements a spec that's wrong — the spec gets fixed too, keeping all artifacts consistent.
+
+### External Evidence Verification
+
+When the Challenger cites evidence from outside the codebase (SDK documentation, web resources, API references), the Orchestrator verifies the claims before forwarding them to the Writer. This prevents two failure modes:
+- The Writer chasing phantom issues based on hallucinated evidence
+- The Writer dismissing valid findings by assuming "the Challenger might be wrong"
+
+For findings with `evidence_type: "external"`:
+
+1. The Orchestrator spawns a lightweight verification agent (Haiku, ephemeral) with web search and web fetch access.
+2. The agent attempts to confirm or refute the external claim against the cited source.
+3. Verified claims are marked `evidence_verified: true` in the finding before it reaches the Writer.
+4. Unverifiable claims (source not found, ambiguous) are flagged — the Writer sees them but knows the evidence couldn't be independently confirmed.
+5. Refuted claims (the Challenger was wrong) → the finding is removed before it reaches the Writer. Logged in the DDL as "Challenger error — evidence refuted."
+
+This adds one lightweight agent call per finding with external evidence. The cost is minimal (Haiku, small context) relative to the value of preventing either phantom issues or dismissed valid findings.
 
 ## Inter-Agent Message Format
 
@@ -378,7 +473,8 @@ This prevents mid-run failures from malformed JSON — an avoidable failure mode
     { "id": 2, "text": "...", "source": "spec section 5", "status": "verified", "evidence": "..." }
   ],
   "findings": [
-    { "id": 1, "summary": "...", "severity": "CRITICAL", "assumption_id": 1, "counter_design_divergence": true, "evidence": [...], "recommendation": "..." }
+    { "id": 1, "summary": "...", "severity": "CRITICAL", "assumption_id": 1, "counter_design_divergence": true, "upstream_issue": false, "upstream_source": null, "evidence": [...], "evidence_type": "codebase", "recommendation": "..." },
+    { "id": 2, "summary": "...", "severity": "CRITICAL", "assumption_id": null, "counter_design_divergence": false, "upstream_issue": true, "upstream_source": "docs/superpowers/specs/2026-04-09-design.md", "evidence": [...], "evidence_type": "external", "recommendation": "..." }
   ],
   "pass": false
 }
@@ -401,10 +497,8 @@ This prevents mid-run failures from malformed JSON — an avoidable failure mode
 ```json
 {
   "forwarded_findings": [
-    { "original_id": 1, "adjusted_severity": "CRITICAL", "rationale": "Backed by file evidence, would change auth architecture" }
-  ],
-  "ddl_only_findings": [
-    { "original_id": 4, "reason": "won't change decision", "rationale": "Naming convention preference, not architectural" }
+    { "original_id": 1, "adjusted_severity": "CRITICAL", "rationale": "Backed by file evidence, would change auth architecture" },
+    { "original_id": 4, "adjusted_severity": "MINOR", "rationale": "Naming convention preference — still actionable, Writer should address" }
   ],
   "filtered_findings": [
     { "original_id": 7, "reason": "not actionable", "rationale": "No evidence cited, vague concern" }
@@ -421,7 +515,7 @@ This prevents mid-run failures from malformed JSON — an avoidable failure mode
     { "id": 1, "summary": "...", "severity": "CRITICAL", "evidence": "...", "recommendation": "...", "counter_design_context": "Challenger's alternative approach was..." }
   ],
   "counter_design_summary": "The Challenger independently proposed...",
-  "instruction": "Address all CRITICAL and IMPORTANT findings. Consider the Challenger's alternative approach where relevant. Update the spec file."
+  "instruction": "Address all findings regardless of severity. Prioritize CRITICAL first, then IMPORTANT, then MINOR. Consider the Challenger's alternative approach where relevant. Update the spec file."
 }
 ```
 
@@ -464,16 +558,21 @@ The Orchestrator captures every significant decision from the Writer-Challenger 
 - **Evidence**: config/database.yml:18, infrastructure/pgbouncer.ini:3
 - **Round**: Spec Review, Round 2
 
-## DDL-Only (Minor findings captured for reference)
-- **Naming**: Challenger suggested `ConnectionManager` over `PoolHandler` -- stylistic, no architectural impact
-- **Docs**: Missing JSDoc on internal helper -- not blocking
+## Decision 3: Naming — ConnectionManager over PoolHandler
+- **Context**: Challenger suggested `ConnectionManager` over `PoolHandler`
+- **Challenger concern**: MINOR — naming convention inconsistency with rest of codebase
+- **Resolution**: Writer renamed to `ConnectionManager` for consistency
+- **Round**: Spec Review, Round 1
+
+## Filtered (Judge removed — not actionable)
+- Finding 7: Vague concern about "future scalability" with no evidence cited
 ```
 
 This is generated automatically from the structured inter-agent messages. The Orchestrator extracts decisions whenever:
-- A Challenger finding causes the Writer to change the design
+- A Challenger finding causes the Writer to change the design (any severity)
 - The Writer explicitly rejects a Challenger concern with reasoning
 - The user provides direction at a gate
-- The Judge demotes a finding to DDL-only (captured with rationale)
+- The Judge filters a finding as non-actionable (captured with rationale)
 
 The DDL is saved alongside the spec and plan as a first-class output artifact.
 
@@ -533,12 +632,17 @@ The Orchestrator collects metrics per run to measure whether the Challenger is a
 | Metric | What it measures | Healthy range |
 |--------|-----------------|---------------|
 | **Assumption survival rate** | % of extracted assumptions that survived falsification | 70-85%. Below 70% = Writer producing weak designs. Above 85% = Challenger not digging deep enough. |
-| **Finding resolution rate** | % of CRITICAL/IMPORTANT findings resolved by Writer | >90%. Unresolved CRITICALs that reach the user are the clearest signal of system failure. |
-| **Judge filter rate** | % of Challenger findings filtered or demoted by Judge | 20-40%. Below 20% = Challenger is already precise, Judge may be unnecessary. Above 40% = Challenger is too noisy. |
+| **Finding resolution rate** | % of all findings (any severity) resolved by Writer | 100%. The checklist enforces every finding gets a disposition. Below 100% = Orchestrator enforcement bug. |
+| **Finding rejection rate** | % of findings the Writer rejected (with reasoning) vs. addressed | Track over time. Consistently high = Writer may be dismissive, or Challenger producing low-value findings. |
+| **Judge filter rate** | % of Challenger findings filtered by Judge (non-actionable or duplicate) | 10-30%. Below 10% = Challenger is already precise, Judge may be unnecessary. Above 30% = Challenger is too noisy. |
 | **Counter-design divergence impact** | % of forwarded findings that originated from counter-design analysis | >30%. If counter-design never surfaces unique findings, dialectical inquiry isn't adding value. |
+| **Pre-review assumption refutation rate** | % of Writer's external assumptions refuted by verification before review | Track over time. Consistently high = Writer not checking its own assumptions. Consistently 0% = verification may be unnecessary. |
+| **Upstream issue rate** | % of findings flagged as upstream issues (bugs in source docs, not current artifact) | Track over time. Non-zero is expected when reviewing downstream artifacts (plans). |
+| **External evidence verification rate** | % of external Challenger claims verified vs. refuted | >90%. Below 90% = Challenger is hallucinating evidence too often. |
+| **Checklist re-prompt rate** | % of rounds where the Writer had to be re-prompted for missing dispositions | Track over time. Should decrease as Writer prompts improve. Non-zero is expected — the enforcement catches what prompts miss. |
 | **Spec diff size** | Lines changed between pre-review and post-review spec | Non-zero. If the Challenger drives zero substantive changes, it's rubber-stamping. |
 | **Gate outcome** | User approved / requested changes / aborted at each gate | Track over time. Consistent approvals with no changes = gates aren't surfacing useful info OR system is working perfectly. |
-| **Cost** | Total USD spent (input + output tokens across all agents) | Track per run for budgeting. |
+| **Cost** | Total USD spent (input + output tokens across all agents, including verification agents) | Track per run for budgeting. |
 | **Duration** | Wall-clock time per stage and total | Track for UX expectations. |
 | **Rounds used** | How many review rounds per stage before passing | Avg 1.5-2.5 is healthy. Consistently 3 = Challenger may be too aggressive or Writer too weak. Consistently 1 = Challenger may be too lenient. |
 
@@ -596,27 +700,40 @@ Models: Writer=claude-opus-4-6, Challenger=claude-opus-4-6, Judge=claude-haiku-4
 - Gate: Approved
 
 ## Stage 2: Spec Review
+- Pre-review assumption verification: 3 external assumptions checked, 1 refuted (SDK API), Writer fixed before review
 - Round 1 (Counter-Design + Hypothesis Tester): 8 assumptions extracted, 2 falsified
     -> 3 CRITICAL, 1 IMPORTANT, 2 MINOR
-    -> Judge forwarded 3 CRITICAL + 1 IMPORTANT, captured 2 MINOR in DDL
+    -> Verifier confirmed 2 external evidence claims, 0 refuted
+    -> Judge forwarded all 6, filtered 0
     -> 1 finding originated from counter-design divergence
+    -> Writer disposition: 6/6 addressed (checklist complete)
 - Round 2 (Skeptical Verifier): 1 fix inadequate, 1 new IMPORTANT found
     -> Judge forwarded all
-- Round 3: Not needed -- passed after Round 2
+    -> Writer re-prompted for missing disposition on finding 8 (checklist caught it)
+    -> Writer disposition: 2/2 addressed after re-prompt
+- Round 3: Not needed -- all findings addressed after Round 2
 - Gate: Approved
 
 ## Stage 3: Plan Review
+- Pre-review assumption verification: 2 external assumptions checked, 0 refuted
 - Round 1 (Counter-Design + Hypothesis Tester): 5 assumptions, all verified
-    -> 0 CRITICAL, 2 IMPORTANT
-    -> Judge forwarded both
+    -> 0 CRITICAL, 2 IMPORTANT, 1 MINOR
+    -> 1 finding flagged as upstream issue (spec bug), Writer fixed both plan and spec
+    -> Judge forwarded all 3
+    -> Writer disposition: 3/3 addressed (checklist complete)
 - Round 2 (Skeptical Verifier): All addressed
 - Gate: Approved
 
 ## Quality Metrics
 - Assumption survival rate: 77% (10/13 verified)
-- Finding resolution rate: 100% (all CRITICAL/IMPORTANT resolved)
-- Judge filter rate: 25% (3/12 filtered or DDL-only)
+- Pre-review assumption refutation rate: 20% (1/5 refuted before review)
+- Finding resolution rate: 100% (all findings addressed — checklist enforced)
+- Finding rejection rate: 0% (no findings rejected this run)
+- Judge filter rate: 10% (1/10 filtered as non-actionable)
 - Counter-design divergence impact: 33% (2/6 forwarded findings from counter-design)
+- Upstream issue rate: 11% (1/9 findings flagged as upstream)
+- External evidence verification rate: 100% (2/2 Challenger claims verified)
+- Checklist re-prompt rate: 11% (1/9 rounds required re-prompt for missing disposition)
 - Spec diff: 47 lines changed across 4 sections
 
 ## Artifacts
@@ -661,7 +778,7 @@ Every run produces up to 4 artifacts in the target repo:
 |----------|-----------------|-------------|
 | **Spec** | `docs/superpowers/specs/YYYY-MM-DD-<topic>-design.md` | The design document |
 | **Plan** | `docs/superpowers/plans/YYYY-MM-DD-<topic>-plan.md` | The implementation plan |
-| **DDL** | `docs/superpowers/specs/YYYY-MM-DD-<topic>-decisions.md` | Why every decision was made (includes Judge-demoted findings) |
+| **DDL** | `docs/superpowers/specs/YYYY-MM-DD-<topic>-decisions.md` | Why every decision was made (includes filtered findings for the record) |
 | **Summary** | `docs/superpowers/specs/YYYY-MM-DD-<topic>-run-summary.md` | Process record with quality metrics |
 
 All overridable with `--output-dir`. Auto-committed to git at each gate after user approval.
@@ -679,7 +796,7 @@ All overridable with `--output-dir`. Auto-committed to git at each gate after us
 - Challenger findings printed as discovered with severity badges
 - Counter-design summary displayed before findings in Round 1
 - Assumption list displayed when extracted
-- Judge filtering displayed: `Judge: 5 findings -> 3 forwarded, 1 DDL-only, 1 filtered`
+- Judge filtering displayed: `Judge: 5 findings -> 4 forwarded, 1 filtered`
 - Gates are visually distinct — bordered, with clear action prompts
 
 ### Quiet Mode
@@ -706,6 +823,8 @@ design-challenger/
       writer.ts            # Writer session management
       challenger.ts        # Challenger session management
       judge.ts             # Judge agent (ephemeral per evaluation)
+      verifier.ts          # Verification agent (ephemeral per check)
+      checklist.ts         # Finding-level checklist enforcement
       types.ts             # Inter-agent message types
       schemas.ts           # JSON schemas for message validation
     prompts/
@@ -727,6 +846,8 @@ design-challenger/
 - `agents/` encapsulates all SDK interaction — swapping SDK versions or adding agent types doesn't touch orchestration logic
 - `agents/schemas.ts` validates all inter-agent messages at the routing boundary — parse failures are caught before they propagate
 - `agents/judge.ts` is a thin wrapper — the Judge is ephemeral (no persistent session), making it cheap and simple
+- `agents/verifier.ts` is similarly ephemeral — one call per external claim, Haiku model, minimal context
+- `agents/checklist.ts` is pure Orchestrator logic (no LLM) — mechanical tracking of finding IDs and dispositions
 - `prompts/` are markdown files loaded at runtime — editable without recompiling, easy to iterate on
 - `ui/` is separate from orchestration — can add Telegram/Slack notifications later without touching the flow
 - `state.ts` handles all checkpointing — resume logic is isolated from the flow
