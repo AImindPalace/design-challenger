@@ -32,7 +32,7 @@ Both agents run against the **target repo** (any codebase). The Orchestrator run
 
 ### SDK Integration
 
-Uses `@anthropic-ai/claude-agent-sdk`:
+Uses `@anthropic-ai/claude-agent-sdk`. Authentication uses the host machine's existing Claude Code login — no separate API keys or OAuth.
 
 ```typescript
 import { query } from "@anthropic-ai/claude-agent-sdk";
@@ -50,7 +50,7 @@ const writerSession = query({
   }
 });
 
-// Challenger session — independent, read-only exploration
+// Challenger session — persistent across the entire flow (same as Writer)
 const challengerSession = query({
   prompt: challengerPrompt,
   options: {
@@ -65,6 +65,17 @@ const challengerSession = query({
 ```
 
 Session continuation uses the `resume` option with the session ID captured from the `system` init message.
+
+### Session Persistence
+
+Both the Writer and Challenger maintain **one persistent session each** across the entire run. This is critical:
+
+- The Challenger explores the codebase in Stage 1 and carries that knowledge into Stages 2 and 3. It does not re-explore — it builds on what it already knows.
+- Each review round adds to the Challenger's context, making it sharper with each iteration.
+- With the 1M context window, the Challenger can accumulate deep knowledge about the codebase, project patterns, git history, and web research across all stages and rounds.
+- The Writer similarly accumulates all brainstorming context, Challenger feedback, and user direction across the entire flow.
+
+Both agents get smarter as the run progresses — they never start from zero.
 
 ## Flow
 
@@ -96,12 +107,12 @@ Orchestrator
   ├── Continues Writer session: "Write the design spec"
   │     Writer produces full spec document
   │
-  ├── Starts Challenger review: "Review this spec against the codebase"
-  │     Challenger attacks the spec with structured findings
+  ├── Continues Challenger session: "Review this spec against the codebase"
+  │     Challenger attacks the spec — already has full codebase context from Stage 1
   │
   ├── Review cycle (max 3 rounds):
   │     Writer addresses CRITICAL + IMPORTANT findings
-  │     Challenger re-reviews
+  │     Challenger re-reviews (with accumulated context from all prior rounds)
   │     Repeat until pass or max rounds
   │
   └── GATE 2 → User sees: spec file path, review summary, any unresolved concerns
@@ -115,8 +126,8 @@ Orchestrator
   ├── Continues Writer session: "Write the implementation plan"
   │     Writer produces detailed plan
   │
-  ├── Starts Challenger review: "Review this plan against the codebase"
-  │     Same structured review cycle
+  ├── Continues Challenger session: "Review this plan against the codebase"
+  │     Same structured review cycle — Challenger now has context from brainstorming + spec review
   │
   └── GATE 3 → User sees: plan file path, review summary
         [Approve / Request changes / Abort]
@@ -259,11 +270,13 @@ v1 is intentionally scoped, but the architecture supports evolution:
 - The Challenger's read-only constraint is enforced by limiting its `allowedTools` (no Write, Edit) and its system prompt. Bash is included for read-only commands (git log, npm list, etc.) — the system prompt instructs it not to modify anything.
 - Both agents share the same filesystem (the target repo) but run in separate sessions with independent conversation context.
 
-## Out of Scope for v1
+## Deferred to Future Versions
 
-- Web UI or dashboard
-- Telegram/Slack notifications (terminal only)
-- Custom Challenger prompt files
-- Multiple Challengers per review
-- Integration with CI/CD
-- Cost tracking / budget enforcement beyond SDK's `maxBudgetUsd`
+Not rejected — deferred. The architecture supports all of these without rewrites:
+
+- **Notification channels** (Telegram, Slack) — add adapters in `ui/notifications.ts`
+- **Custom Challenger prompts** — load user-provided markdown via `--challenger-prompt`
+- **Multiple Challengers** — spawn N in parallel, merge findings
+- **Web UI / dashboard** — the orchestrator can emit events to a web frontend
+- **CI/CD integration** — run headless with `--quiet` and exit codes
+- **Cost tracking** — aggregate SDK usage data across agents
