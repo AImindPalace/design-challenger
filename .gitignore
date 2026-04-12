@@ -1,0 +1,5 @@
+node_modules/
+dist/
+.design-challenger/
+*.tsbuildinfo
+.claude/settings.local.json

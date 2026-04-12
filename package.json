@@ -1,0 +1,30 @@
+{
+  "name": "design-challenger",
+  "version": "0.1.0",
+  "description": "CLI that orchestrates adversarial AI agents to stress-test design specs before implementation",
+  "type": "module",
+  "bin": {
+    "design-challenger": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "lint": "tsc --noEmit",
+    "start": "node dist/cli.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "author": "Brandon Verbeck",
+  "license": "MIT",
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.101",
+    "ajv": "^8.17.1",
+    "chalk": "^5.4.1",
+    "commander": "^13.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "typescript": "^5.8.3"
+  }
+}
